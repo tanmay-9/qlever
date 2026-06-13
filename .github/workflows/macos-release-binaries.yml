@@ -1,0 +1,81 @@
+name: Build macOS release binaries (arm64)
+
+# Builds qlever-index and qlever-server on an Apple Silicon runner and uploads
+# them as a single tar.gz (binaries at the archive root, no enclosing folder).
+# Triggered by pushing a tag; the build mirrors macos-appleclang-native.yml so
+# the binaries link against Homebrew's libraries, matching a Homebrew bottle.
+#
+# A tag-push trigger runs the workflow file as it exists at the tagged commit,
+# so (unlike workflow_dispatch) it does not require this file to live on the
+# fork's default branch. The version is taken from the tag name itself.
+#
+# Usage:  git tag 0.5.47 <commit> && git push origin 0.5.47
+# Download with:  gh run download -n qlever-macos-arm64
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  build:
+    runs-on: macos-26  # Apple Silicon (arm64), macOS Tahoe
+    steps:
+      # fetch-depth: 0 fetches full history and all tags. Required so the
+      # CMake build's `git describe --tags` (GitVersion.cmake) resolves the
+      # tag on the checked-out commit; otherwise the binaries' --version
+      # reports only the short hash instead of the release version.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify version matches git describe (fail fast before building)
+        # Runs the exact command GitVersion.cmake bakes into the binaries and
+        # checks it equals the tag name. They differ only if the tag is not
+        # directly on the checked-out commit (git describe would then append
+        # -N-g<hash>); aborting here avoids a slow build with a wrong version.
+        run: |
+          DESCRIBED=$(git describe --tags --always)
+          echo "git describe: $DESCRIBED"
+          echo "tag name:     ${{ github.ref_name }}"
+          if [ "$DESCRIBED" != "${{ github.ref_name }}" ]; then
+            echo "::error::git describe ('$DESCRIBED') does not match the tag ('${{ github.ref_name }}'). The tag must sit directly on the commit being built."
+            exit 1
+          fi
+          # Strip a leading "v" for the archive name (tag v0.5.47 -> file 0.5.47).
+          # The in-binary --version keeps the full tag verbatim via git describe.
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies via Homebrew
+        run: |
+          brew update
+          brew install boost icu4c openssl@3 zstd jemalloc pkg-config
+          echo PATH="$(brew --prefix icu4c)/bin:$(brew --prefix icu4c)/sbin:$PATH" >> $GITHUB_ENV
+          echo PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$(brew --prefix icu4c)/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Print clang version
+        run: clang++ --version
+
+      - name: Configure CMake
+        run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DLOGLEVEL=INFO -DUSE_PARALLEL=false -D_NO_TIMING_TESTS=ON -DCOMPILER_SUPPORTS_MARCH_NATIVE=FALSE -DICU_ROOT=$(brew --prefix icu4c) -GNinja
+
+      - name: Build the binaries
+        run: cmake --build ${{github.workspace}}/build --config Release -- -j $(sysctl -n hw.ncpu)
+
+      - name: Smoke test (binaries start and respond to --help)
+        working-directory: ${{github.workspace}}/build
+        run: |
+          ./qlever-index --help > /dev/null
+          ./qlever-server --help > /dev/null
+
+      - name: Package binaries into a flat tar.gz
+        # -C build => archive entries are just "qlever-index" and "qlever-server",
+        # so decompression drops the two binaries directly with no parent folder.
+        run: tar -czf qlever_${{ env.VERSION }}_macos_arm64.tar.gz -C ${{github.workspace}}/build qlever-index qlever-server
+
+      - name: Upload tar.gz
+        uses: actions/upload-artifact@v4
+        with:
+          name: qlever-macos-arm64
+          path: qlever_${{ env.VERSION }}_macos_arm64.tar.gz
+          if-no-files-found: error
