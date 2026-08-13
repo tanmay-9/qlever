@@ -178,8 +178,11 @@ CompressedRelationReader::asyncParallelBlockGenerator(
           reader_{reader} {}
 
     void start() {
-      auto numThreads{
-          getRuntimeParameter<&RuntimeParameters::lazyIndexScanNumThreads_>()};
+      // The rebuild's dedicated reader may override the thread count (to reduce
+      // the rebuild's peak CPU); otherwise use the runtime parameter, which is
+      // what all query scans use.
+      auto numThreads{reader_->lazyScanNumThreadsOverride_.value_or(
+          getRuntimeParameter<&RuntimeParameters::lazyIndexScanNumThreads_>())};
       auto queueSize{
           getRuntimeParameter<&RuntimeParameters::lazyIndexScanQueueSize_>()};
       auto producer{std::bind(&Generator::readAndDecompressBlock, this)};
@@ -930,7 +933,7 @@ std::pair<size_t, size_t> CompressedRelationReader::getResultSizeImpl(
       const auto [ins, del] =
           locatedTriplesPerBlock.numTriples(block.blockIndex_);
       auto trunc = [divisor](size_t num) {
-        return std::max(std::min(num, 1ul), num / divisor);
+        return std::max<size_t>(std::min<size_t>(num, 1), num / divisor);
       };
       inserted += trunc(ins);
       deleted += trunc(del);
@@ -1053,13 +1056,13 @@ IdTable CompressedRelationReader::getDistinctColIdsAndCounts(
   // the count from the metadata.
   for (const auto& [i, blockMetadata] : ranges::views::enumerate(blocks)) {
     // The `numRows_` metadata shortcut is safe iff all rows of the block
-    // agree on the grouped column. Because triples within a block are sorted
-    // lexicographically by `(col0Id, col1Id, col2Id)`, that is equivalent to
-    // `firstTriple_` and `lastTriple_` agreeing on the first `columnIndex + 1`
-    // columns.
-    if (!blockMetadata.containsInconsistentTriples(columnIndex + 1)) {
-      // The whole block has the same `colId` -> we get all the information
-      // from the metadata.
+    // agree on the grouped column AND the block has no delta triples. The
+    // column uniformity is equivalent to `firstTriple_` and `lastTriple_`
+    // agreeing on the first `columnIndex + 1` columns.
+    if (!blockMetadata.containsInconsistentTriples(columnIndex + 1) &&
+        !locatedTriplesPerBlock.containsTriples(blockMetadata.blockIndex_)) {
+      // The whole block has the same `colId` and no delta triples ->
+      // we get all the information from the metadata.
       Id colId = getMaskedTriple(blockMetadata.firstTriple_)[columnIndex];
       bool abort = processColId(colId, blockMetadata.numRows_);
       if (abort) {
@@ -1453,7 +1456,7 @@ std::pair<size_t, bool> CompressedRelationReader::prepareLocatedTriples(
 
 // _____________________________________________________________________________
 CompressedRelationMetadata CompressedRelationWriter::addSmallRelation(
-    Id col0Id, size_t numDistinctC1, IdTableView<0> relation) {
+    Id col0Id, size_t numDistinctC1, const IdTable& relation) {
   AD_CORRECTNESS_CHECK(!relation.empty());
   size_t numRows = relation.numRows();
   // Make sure that the blocks don't become too large: If the previously
@@ -1503,15 +1506,20 @@ CompressedRelationMetadata CompressedRelationWriter::finishLargeRelation(
 }
 
 // _____________________________________________________________________________
-ad_utility::TaskQueue<false> CompressedRelationWriter::makeBlockWriteQueue() {
-  auto threadCount = static_cast<uint32_t>(
+ad_utility::TaskQueue<false> CompressedRelationWriter::makeBlockWriteQueue(
+    std::optional<size_t> numThreadsOverride) {
+  size_t requestedThreads = numThreadsOverride.value_or(
       getRuntimeParameter<&RuntimeParameters::permutationWriterNumThreads_>());
-  if (threadCount == 0) {
-    threadCount = std::thread::hardware_concurrency();
-  } else {
-    threadCount =
-        std::min<uint32_t>(threadCount, std::thread::hardware_concurrency());
-  }
+  // `hardware_concurrency` may return 0 when it cannot determine the number
+  // of hardware threads; fall back to 1, so that the queue always has a
+  // worker (with 0 workers, the tasks would never run).
+  uint32_t hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+  // Clamp in `size_t` BEFORE casting, so that a huge requested value cannot
+  // truncate to a small (or zero) thread count.
+  uint32_t threadCount = requestedThreads == 0
+                             ? hardwareThreads
+                             : static_cast<uint32_t>(std::min<size_t>(
+                                   requestedThreads, hardwareThreads));
   // Allow at least up to 4 tasks in the queue.
   uint32_t queueSize = std::max<uint32_t>(4, threadCount * 2);
   return ad_utility::TaskQueue<false>{queueSize, threadCount};
@@ -1561,8 +1569,9 @@ CompressedRelationMetadata CompressedRelationWriter::addCompleteLargeRelation(
         ql::ranges::find_if(
             block,
             [&lastRowFromPrevious](const auto& row) {
-              return tieFirstThreeColumns(lastRowFromPrevious) !=
-                     tieFirstThreeColumns(row);
+              return pickFirstThreeColumnsOfIdsWithoutLocalVocab(
+                         lastRowFromPrevious) !=
+                     pickFirstThreeColumnsOfIdsWithoutLocalVocab(row);
             }) -
         block.begin();
 

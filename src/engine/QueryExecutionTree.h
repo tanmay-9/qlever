@@ -34,7 +34,9 @@ class QueryExecutionTree {
     rootOperation_ = std::move(operation);
     resultWidth_ = rootOperation_->getResultWidth();
     cacheKey_ = rootOperation_->getCacheKey();
-    readFromCache();
+    if (!readFromCache()) {
+      readFromMaterializedView();
+    }
   }
 
   std::string getCacheKey() const;
@@ -128,7 +130,12 @@ class QueryExecutionTree {
   // of our qec. If found, we store a shared ptr to pin it
   // and set the size estimate correctly and the cost estimate
   // to zero. Currently multiplicities are not affected
-  void readFromCache();
+  bool readFromCache();
+
+  // Check whether the cache key of this `QueryExecutionTree` matches a loaded
+  // materialized view. If yes, replace the `rootOperation_` with an `IndexScan`
+  // on that view with a result equivalent to the current `rootOperation_`.
+  void readFromMaterializedView();
 
   // recursively get all warnings from descendant operations
   std::vector<std::string> collectWarnings() const {
@@ -173,10 +180,14 @@ class QueryExecutionTree {
 
   // Create a `QueryExecutionTree` that produces exactly the same result as
   // `qet`, but sorted according to the `sortColumns`. If `qet` is already
-  // sorted accordingly, it is simply returned.
+  // sorted accordingly, it is simply returned. If `explicitSort` is `true` and
+  // a `Sort` operation has to be created, that `Sort` will not propagate a
+  // `LIMIT`/`OFFSET` to its subtree. This is used for explicit `INTERNAL SORT
+  // BY` clauses, where the complete sorted result is requested and the
+  // limit-pushdown optimization is undesired.
   static std::shared_ptr<QueryExecutionTree> createSortedTree(
       std::shared_ptr<QueryExecutionTree> qet,
-      const std::vector<ColumnIndex>& sortColumns);
+      const std::vector<ColumnIndex>& sortColumns, bool explicitSort = false);
 
   // Similar to `createSortedTree` (see directly above), but create the sorted
   // trees for two different trees, the sort columns of which are specified as
@@ -240,8 +251,8 @@ class QueryExecutionTree {
     s << tree.getRootOperation()->getDescriptor();
   }
 
-  bool supportsLimitOffset() const {
-    return getRootOperation()->supportsLimitOffset();
+  LimitOffsetHandling handlesLimitOffset() const {
+    return getRootOperation()->handlesLimitOffset();
   }
 
   // Set the value of the `LIMIT`/`OFFSET` clause that will be applied to the

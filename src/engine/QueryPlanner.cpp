@@ -43,6 +43,7 @@
 #include "engine/OrderBy.h"
 #include "engine/PathSearch.h"
 #include "engine/PermutationSelector.h"
+#include "engine/QueryExecutionContext.h"
 #include "engine/QueryExecutionTree.h"
 #include "engine/QueryRewriteUtils.h"
 #include "engine/Service.h"
@@ -222,11 +223,12 @@ std::vector<SubtreePlan> QueryPlanner::createExecutionTrees(ParsedQuery& pq,
 
   for (auto& plan : lastRow) {
     // For subqueries the limit has already been applied, for the root query the
-    // exporter will apply LIMIT and OFFSET if `supportsLimitOffset()` is not
-    // natively supported by the `Operation`. Check the documentation of
+    // exporter will apply LIMIT and OFFSET if `handlesLimitOffset()` returns
+    // `NONE` for the `Operation`. Check the documentation of
     // `ExportQueryExecutionTrees::compensateForLimitOffsetClause` to see how
     // this is handled in the exporter.
-    if (plan._qet->getRootOperation()->supportsLimitOffset() && !isSubquery) {
+    if (plan._qet->handlesLimitOffset() != LimitOffsetHandling::NONE &&
+        !isSubquery) {
       plan._qet->applyLimitOffset(pq._limitOffset);
     }
   }
@@ -475,7 +477,10 @@ std::vector<SubtreePlan> QueryPlanner::getOrderByRow(
         AD_CONTRACT_CHECK(!isDescending);
         sortColumns.push_back(index);
       }
-      tree = QueryExecutionTree::createSortedTree(parent._qet, sortColumns);
+      // An explicit `INTERNAL SORT BY` requests the complete sorted result, so
+      // we must not let the `Sort` propagate a `LIMIT`/`OFFSET` to its subtree.
+      tree =
+          QueryExecutionTree::createSortedTree(parent._qet, sortColumns, true);
     } else {
       AD_CONTRACT_CHECK(pq._isInternalSort == IsInternalSort::False);
       // Note: As the internal ordering is different from the semantic ordering
@@ -2465,6 +2470,13 @@ auto QueryPlanner::applyJoinDistributivelyToUnion(
       return;
     }
 
+    // Don't distribute over a UNION if the other operand is non-deterministic
+    // (e.g. contains BIND(BNODE(...))). Cloning a non-deterministic tree would
+    // produce a copy with the same cache key but potentially different results.
+    if (!other._qet->getRootOperation()->isDeterministic()) {
+      return;
+    }
+
     auto findJoinCandidates = [this, flipped](const SubtreePlan& plan1,
                                               const SubtreePlan& plan2,
                                               const JoinColumns& jcs) {
@@ -2610,8 +2622,7 @@ auto QueryPlanner::createMaterializedViewJoinReplacements(
   // Check if the user allows query rewriting.
   // TODO<ullingerc> Do we want to forcefully disable query rewriting if delta
   // triples are present in the current index to prevent diverging results?
-  if (!getRuntimeParameter<
-          &RuntimeParameters::enableMaterializedViewQueryRewrite_>()) {
+  if (_qec->disableMaterializedViewRewriting()) {
     return plans;
   }
 
